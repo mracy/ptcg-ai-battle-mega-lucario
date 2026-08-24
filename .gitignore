@@ -1,0 +1,20 @@
+# Competition data (licensed - do not redistribute)
+*.pdf
+EN Card Data.csv
+EN_Card_Data.csv
+JP Card Data.csv
+JP_Card_Data.csv
+
+# Build artifacts
+submission.tar.gz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
