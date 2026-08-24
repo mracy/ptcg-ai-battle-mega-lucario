@@ -51,10 +51,16 @@ try:
         to_observation_class,
         all_attack,
         all_card_data,
+        search_begin,
+        search_step,
+        search_end,
+        search_release,
     )
     _CG_AVAILABLE = True
+    _SEARCH_AVAILABLE = True
 except Exception:
     _CG_AVAILABLE = False
+    _SEARCH_AVAILABLE = False
 
     class _DummyEnum:
         def __init__(self, *pairs):
@@ -541,6 +547,20 @@ def _score_attack_option(option, obs, my_state) -> float:
                     score += 5.0  # Need big damage
             except (TypeError, ValueError, AttributeError):
                 pass
+
+    # Opponent aggression adjustment — if opponent is aggressive, prefer KOs
+    aggression = _get_opponent_aggression()
+    if aggression > 0.6 and opp_active is not None:
+        try:
+            opp_hp = int(opp_active.hp)
+            if atk_damage >= opp_hp:
+                score += 10.0  # Extra KO bonus vs aggressive opponents
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+    # If opponent is passive, prefer energy ramp (Aura Jab) over big damage
+    if aggression < 0.3 and AURA_JAB_NAME in atk_name:
+        score += 8.0  # Ramp more vs passive opponents
 
     return min(score, 95.0)
 
@@ -1173,6 +1193,202 @@ def _handle_special_condition_selection(obs) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# Opponent modeling — track opponent patterns across turns
+# ---------------------------------------------------------------------------
+_opponent_tracker: dict = {
+    "turns_observed": 0,
+    "opponent_attacks": [],
+    "opponent_retreats": 0,
+    "opponent_energy_attached": 0,
+    "opponent_supporters_played": [],
+    "opponent_prizes_taken": 0,
+    "last_opp_prize_count": 6,
+    "last_opp_active_id": -1,
+}
+
+
+def _update_opponent_tracker(obs) -> None:
+    """Track opponent behavior across turns for modeling."""
+    opp_state = _get_opp_state(obs)
+    if opp_state is None:
+        return
+
+    current = obs.current
+    if current is None:
+        return
+
+    # Track prize count changes
+    try:
+        opp_prize = len(opp_state.prize) if opp_state.prize else 6
+        if opp_prize < _opponent_tracker["last_opp_prize_count"]:
+            _opponent_tracker["opponent_prizes_taken"] += (
+                _opponent_tracker["last_opp_prize_count"] - opp_prize
+            )
+        _opponent_tracker["last_opp_prize_count"] = opp_prize
+    except (TypeError, AttributeError):
+        pass
+
+    # Track active Pokemon changes (retreats)
+    opp_active = _get_active(opp_state)
+    if opp_active is not None:
+        active_id = _pokemon_id(opp_active)
+        if (
+            _opponent_tracker["last_opp_active_id"] != -1
+            and active_id != _opponent_tracker["last_opp_active_id"]
+        ):
+            _opponent_tracker["opponent_retreats"] += 1
+        _opponent_tracker["last_opp_active_id"] = active_id
+
+    _opponent_tracker["turns_observed"] = current.turn
+
+
+def _get_opponent_aggression() -> float:
+    """Estimate opponent aggression level (0.0 = passive, 1.0 = aggressive)."""
+    if _opponent_tracker["turns_observed"] == 0:
+        return 0.5  # Unknown — assume neutral
+
+    # Aggression = prizes taken per turn + retreat frequency
+    prizes_per_turn = (
+        _opponent_tracker["opponent_prizes_taken"]
+        / max(1, _opponent_tracker["turns_observed"])
+    )
+    retreat_rate = (
+        _opponent_tracker["opponent_retreats"]
+        / max(1, _opponent_tracker["turns_observed"])
+    )
+
+    aggression = min(1.0, prizes_per_turn * 3.0 + retreat_rate * 0.5)
+    return aggression
+
+
+# ---------------------------------------------------------------------------
+# Search API lookahead — simulate future game states
+# ---------------------------------------------------------------------------
+def _evaluate_board_state(obs) -> float:
+    """Evaluate the current board state from our perspective (-100 to +100)."""
+    my_state = _get_my_state(obs)
+    opp_state = _get_opp_state(obs)
+    if my_state is None or opp_state is None:
+        return 0.0
+
+    score = 0.0
+
+    # Prize card advantage
+    my_prizes = len(my_state.prize) if my_state.prize else 6
+    opp_prizes = len(opp_state.prize) if opp_state.prize else 6
+    score += (opp_prizes - my_prizes) * 15.0  # Each prize difference = 15 points
+
+    # Active Pokemon HP advantage
+    my_active = _get_active(my_state)
+    opp_active = _get_active(opp_state)
+    if my_active is not None:
+        score += _pokemon_hp_ratio(my_active) * 10.0
+    if opp_active is not None:
+        score -= _pokemon_hp_ratio(opp_active) * 10.0
+
+    # Bench development
+    my_bench = _count_bench_pokemon(my_state)
+    opp_bench = _count_bench_pokemon(opp_state)
+    score += (my_bench - opp_bench) * 5.0
+
+    # Energy development
+    my_energy = 0
+    if my_active is not None:
+        my_energy += _pokemon_energy_count(my_active)
+    for p in _get_bench(my_state):
+        if p is not None:
+            my_energy += _pokemon_energy_count(p)
+
+    opp_energy = 0
+    if opp_active is not None:
+        opp_energy += _pokemon_energy_count(opp_active)
+    for p in _get_bench(opp_state):
+        if p is not None:
+            opp_energy += _pokemon_energy_count(p)
+
+    score += (my_energy - opp_energy) * 3.0
+
+    # Mega Lucario ex in play bonus
+    if my_active is not None and _is_mega_lucario(my_active):
+        score += 10.0
+    for p in _get_bench(my_state):
+        if p is not None and _is_mega_lucario(p):
+            score += 5.0
+
+    # Hand size advantage
+    my_hand = len(_get_hand(my_state))
+    opp_hand = opp_state.handCount if hasattr(opp_state, "handCount") else 0
+    score += (my_hand - opp_hand) * 1.0
+
+    return max(-100.0, min(100.0, score))
+
+
+def _try_search_lookahead(obs, candidate_indices: list[int]) -> list[int]:
+    """Use the search API to evaluate candidate actions via 1-ply lookahead.
+
+    If the search API is not available or fails, returns the original candidates.
+    """
+    if not _SEARCH_AVAILABLE or not candidate_indices:
+        return candidate_indices
+
+    # Only use lookahead for MAIN selections with few candidates
+    select = obs.select
+    select_type = getattr(select, "type", None)
+    if select_type != SelectType.MAIN:
+        return candidate_indices
+
+    # Limit to top 3 candidates to avoid excessive search
+    candidates = candidate_indices[:3]
+    if len(candidates) <= 1:
+        return candidates
+
+    best_candidate = candidates[0]
+    best_score = -float("inf")
+
+    for cand_idx in candidates:
+        try:
+            search_id = search_begin([cand_idx])
+            if search_id is None or search_id < 0:
+                continue
+
+            # Step through the simulation
+            step_result = search_step(search_id, [cand_idx])
+            if step_result is not None:
+                # Evaluate the resulting state
+                simulated_obs = step_result
+                if hasattr(simulated_obs, "current"):
+                    board_score = _evaluate_board_state(simulated_obs)
+                else:
+                    board_score = 0.0
+
+                # Add the original heuristic score as a tiebreaker
+                options = list(select.option)
+                if cand_idx < len(options):
+                    heuristic_score = _score_main_option(options[cand_idx], obs, _get_my_state(obs))
+                else:
+                    heuristic_score = 0.0
+
+                total_score = board_score + heuristic_score * 0.3
+
+                if total_score > best_score:
+                    best_score = total_score
+                    best_candidate = cand_idx
+
+            search_end()
+            search_release(search_id)
+        except Exception:
+            # Search API failed — fall back to heuristic
+            try:
+                search_end()
+                search_release(search_id)
+            except Exception:
+                pass
+            continue
+
+    return [best_candidate]
+
+
+# ---------------------------------------------------------------------------
 # Main agent function
 # ---------------------------------------------------------------------------
 def _choose_indices(obs) -> list[int]:
@@ -1231,6 +1447,11 @@ def agent(obs_dict: dict) -> list[int]:
 
     When called with a non-dict or when select is None, returns the 60-card deck.
     Otherwise, returns a list of option indices for the current selection.
+
+    Enhanced with:
+    - Opponent behavior tracking across turns
+    - Search API lookahead (1-ply simulation) for MAIN selections
+    - Board state evaluation
     """
     # Deck selection phase
     if not isinstance(obs_dict, dict):
@@ -1246,10 +1467,21 @@ def agent(obs_dict: dict) -> list[int]:
     if obs.select is None:
         return read_deck_csv()
 
+    # Update opponent tracker for modeling
+    try:
+        _update_opponent_tracker(obs)
+    except Exception:
+        pass
+
     # Make a selection
     try:
         result = _choose_indices(obs)
         if result:
+            # Try search API lookahead for MAIN selections
+            select = obs.select
+            select_type = getattr(select, "type", None)
+            if select_type == SelectType.MAIN and len(result) == 1:
+                result = _try_search_lookahead(obs, result)
             return result
     except Exception:
         pass
